@@ -4,6 +4,7 @@ import os
 import sys
 
 def main():
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     print("--- Testing Standalone CUTLASS MXFP4 Kernel ---")
 
     # 1. Setup Paths
@@ -101,6 +102,7 @@ def main():
             expert_offsets,
             sf_offsets
         )
+        torch.cuda.synchronize()
         print("[SUCCESS] Kernel executed without error.")
     except RuntimeError as e:
         print(f"\n[ERROR] Caught RuntimeError during execution:")
