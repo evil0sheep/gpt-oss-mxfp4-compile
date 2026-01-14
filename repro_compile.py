@@ -132,6 +132,8 @@ def main():
         "Success! GPUModelRunner executed profile_run, init_kv_cache, and capture_model."
     )
 
+    torch.distributed.destroy_process_group()
+
 
 if __name__ == "__main__":
     main()
