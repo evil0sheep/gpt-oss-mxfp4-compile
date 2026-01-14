@@ -33,10 +33,7 @@ def main():
                 "-O3",
                 "-std=c++17",
                 "-DENABLE_NVFP4_SM120",
-                "--expt-relaxed-constexpr",
-                "-U__CUDA_NO_HALF_OPERATORS__",
-                "-U__CUDA_NO_HALF_CONVERSIONS__",
-                "-U__CUDA_NO_HALF2_OPERATORS__"
+                "--expt-relaxed-constexpr"
             ],
             verbose=True
         )
