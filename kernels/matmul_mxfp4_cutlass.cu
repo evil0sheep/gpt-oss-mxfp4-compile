@@ -526,7 +526,7 @@ void run_fp4_blockwise_scaled_group_mm_sm120(
               " M=", M, " N=", N, " K=", K);
 
   status = gemm_op.run(args, workspace.data_ptr(), stream);
-  TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
+  TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM: ", cutlassGetStatusString(status));
 }
 
 template <typename OutType>

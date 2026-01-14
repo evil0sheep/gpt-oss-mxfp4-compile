@@ -50,6 +50,10 @@ struct enable_sm100_only : Kernel {
   }
 };
 
+
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
+
 template <typename Kernel>
 struct enable_sm120_only : Kernel {
   template <typename... Args>
