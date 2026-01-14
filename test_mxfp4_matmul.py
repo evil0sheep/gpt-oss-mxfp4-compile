@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import os
 import sys
 import inspect
@@ -27,26 +28,11 @@ def main():
     # 2. Inspect the source for the known bug
     if hasattr(hub, "matmul_ogs"):
         matmul_ogs_mod = hub.matmul_ogs
+
         if hasattr(matmul_ogs_mod, "matmul_ogs"):
             func = matmul_ogs_mod.matmul_ogs
             src_file = inspect.getfile(func)
             print(f"[INFO] matmul_ogs source file: {src_file}")
-
-            # Look for the internal file where the error occurred
-            dir_path = os.path.dirname(src_file)
-            finalize_path = os.path.join(dir_path, "matmul_ogs_details", "_finalize_matmul.py")
-
-            if os.path.exists(finalize_path):
-                with open(finalize_path, "r") as f:
-                    content = f.read()
-                    if "cuda_capability_geq" in content:
-                        print(f"[CHECK] Found 'cuda_capability_geq' usage in {finalize_path}")
-                        if "def cuda_capability_geq" not in content and "import cuda_capability_geq" not in content:
-                             print("[CONFIRMATION] 'cuda_capability_geq' is NOT defined or imported in the file. This confirms the bug.")
-                    else:
-                        print("[CHECK] 'cuda_capability_geq' string not found in file.")
-            else:
-                print(f"[WARN] Could not find {finalize_path}")
         else:
             print("[WARN] hub.matmul_ogs does not have 'matmul_ogs' attribute")
     else:
@@ -69,7 +55,7 @@ def main():
         return
 
     # Prepare Dummy Data
-    M, K, N = 1, 128, 128 # Small size
+    M, K, N = 1, 4096, 4096 # Large size to trigger Split-K
 
     # Input X
     x = torch.randn(M, K, device=device, dtype=torch.bfloat16)
@@ -131,14 +117,50 @@ def main():
                  print(f"[INFO] Direct swiglu call failed (expected for raw kernel): {e}")
 
         # Try matmul_ogs
-        print("\n[INFO] Invoking matmul_ogs (expecting failure due to missing symbols)...")
+        print("\n[INFO] Invoking matmul_ogs...")
         matmul_ogs = hub.matmul_ogs.matmul_ogs
+        PrecisionConfig = hub.matmul_ogs.PrecisionConfig
 
-        # We need a routing_data object.
-        # Since we can't easily construct it without more reverse engineering,
-        # passing None might trigger validation or crash earlier.
+        # We need to wrap this in a Module to test torch.compile
+        class HFMatmulWrapper(nn.Module):
+            def __init__(self, func, precision_config_cls):
+                super().__init__()
+                self.func = func
+                self.precision_config_cls = precision_config_cls
 
-        # But we validated the bug statically above, which is the main goal.
+            def forward(self, x, w, w_scale):
+                # Construct config inside (or passed in)
+                pc = self.precision_config_cls(weight_scale=w_scale, out_dtype=torch.bfloat16)
+                # Call function. x, w, bias=None, ...
+                return self.func(x, w, None, precision_config=pc)
+
+        model = HFMatmulWrapper(matmul_ogs, PrecisionConfig).to(device)
+
+        print("Running eager execution...")
+        try:
+            out_eager = model(x, w_q_sw, w_s_sw)
+            print("[SUCCESS] Eager execution worked!")
+            print(f"Output shape: {out_eager.shape}")
+        except Exception as e:
+            print(f"[ERROR] Eager execution failed: {e}")
+
+        print("\n[INFO] Testing torch.compile on matmul_ogs...")
+        compiled_model = torch.compile(model, backend="inductor", mode="reduce-overhead")
+
+        try:
+            print("Running warmup...")
+            out_c = compiled_model(x, w_q_sw, w_s_sw)
+            print("[SUCCESS] Compiled execution (warmup) worked!")
+
+            print("Running benchmark...")
+            for _ in range(5):
+                out_c = compiled_model(x, w_q_sw, w_s_sw)
+            print("[SUCCESS] Compiled execution benchmark worked!")
+
+        except Exception as e:
+            print(f"[ERROR] Compiled execution failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     except Exception as e:
         print(f"[ERROR] Setup failed: {e}")
