@@ -38,6 +38,9 @@ def main():
                 "-DENABLE_CUTLASS_MOE_SM120=1",
                 "-DCUTLASS_NVCC_ARCHS=120a",
                 "--expt-relaxed-constexpr",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_HALF2_OPERATORS__"
             ],
             verbose=True
         )
