@@ -41,20 +41,6 @@ inline int32_t get_sm_version_num() {
 
 
 template <typename Kernel>
-struct enable_sm100_only : Kernel {
-  template <typename... Args>
-  CUTLASS_DEVICE void operator()(Args&&... args) {
-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ == 1000
-    Kernel::operator()(std::forward<Args>(args)...);
-#endif
-  }
-};
-
-
-#define STR_HELPER(x) #x
-#define STR(x) STR_HELPER(x)
-
-template <typename Kernel>
 struct enable_sm120_only : Kernel {
   template <typename... Args>
   CUTLASS_DEVICE void operator()(Args&&... args) {
