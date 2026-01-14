@@ -1,3 +1,4 @@
+import argparse
 import os
 import random
 import sys
@@ -13,7 +14,7 @@ sys.path.append(transformers_path)
 
 print(f"Added {transformers_path} to sys.path")
 
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.utils.quantization_config import Mxfp4Config
 
 
@@ -26,23 +27,46 @@ def set_seed(seed: int) -> None:
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mxfp4",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use MXFP4 quantization",
+    )
+    args = parser.parse_args()
+
     print("Initializing...")
     set_seed(0)
 
     model_name = "openai/gpt-oss-20b"
 
-    print(f"Loading model {model_name} with MXFP4 quantization...")
+    if args.mxfp4:
+        print(f"Loading model {model_name} with MXFP4 quantization...")
+        kwargs = {"quantization_config": Mxfp4Config()}
+    else:
+        print(f"Loading model {model_name} with bfloat16 and forced dequantization...")
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        # Increase position embeddings for large context tests
+        config.max_position_embeddings = 131072 * 2
 
-    # Configure quantization
-    quantization_config = Mxfp4Config()
+        # Disable MXFP4 kernels
+        if hasattr(config, "quantization_config"):
+            qc = config.quantization_config
+            if isinstance(qc, dict):
+                qc["dequantize"] = True
+            else:
+                qc.dequantize = True
+
+        kwargs = {"config": config}
 
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
-            quantization_config=quantization_config,
             device_map="cuda",
             trust_remote_code=True,
+            **kwargs,
         )
     except Exception as e:
         print(f"Error loading model via AutoModel: {e}")
