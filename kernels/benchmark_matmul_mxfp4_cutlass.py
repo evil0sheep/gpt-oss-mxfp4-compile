@@ -48,7 +48,7 @@ def main():
     # 2. Prepare Inputs (W4A4)
     device = torch.device("cuda")
     # Using a small problem size matching the test script to verify functionality
-    M, N, K = 16, 128, 128
+    M, N, K = 256, 4096, 4096
 
     print(f"[INFO] Problem Size: M={M}, N={N}, K={K}")
 
@@ -80,12 +80,16 @@ def main():
 
     inputs = (output, a, b, a_scales, b_scales, alphas, problem_sizes, expert_offsets, sf_offsets, M, N, K)
 
+
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "12.0a"
     # 3. Define Configurations
     base_flags = [
         "-O3",
         "-std=c++17",
-        "-DENABLE_NVFP4_SM120",
-        "--expt-relaxed-constexpr"
+        "-DENABLE_NVFP4_SM120=1",
+        "-DENABLE_CUTLASS_MOE_SM120=1",
+        "-DCUTLASS_NVCC_ARCHS=120a",
+        "--expt-relaxed-constexpr",
     ]
 
     # Flags to force enablement of half operators in CUDA headers

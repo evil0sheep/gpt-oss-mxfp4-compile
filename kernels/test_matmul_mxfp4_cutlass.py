@@ -24,6 +24,7 @@ def main():
     print(f"       Source: {source_file}")
     print(f"       Includes: {cutlass_include}")
 
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "12.0a"
     # 2. JIT Compile the Extension
     try:
         mxfp4_ext = load(
@@ -33,8 +34,10 @@ def main():
             extra_cuda_cflags=[
                 "-O3",
                 "-std=c++17",
-                "-DENABLE_NVFP4_SM120",
-                "--expt-relaxed-constexpr"
+                "-DENABLE_NVFP4_SM120=1",
+                "-DENABLE_CUTLASS_MOE_SM120=1",
+                "-DCUTLASS_NVCC_ARCHS=120a",
+                "--expt-relaxed-constexpr",
             ],
             verbose=True
         )
