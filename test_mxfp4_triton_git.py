@@ -5,10 +5,10 @@ import sys
 import inspect
 
 # Add local triton kernels to path
-# The structure is deps/triton/python/triton_kernels/triton_kernels
-# So we add deps/triton/python/triton_kernels to sys.path to be able to import triton_kernels
+# The structure is kernels/triton_kernels
+# So we add kernels to sys.path to be able to import triton_kernels
 repo_root = os.path.dirname(os.path.abspath(__file__))
-triton_kernels_path = os.path.join(repo_root, "deps", "triton", "python", "triton_kernels")
+triton_kernels_path = os.path.join(repo_root, "kernels")
 
 if os.path.exists(triton_kernels_path):
     # Insert at beginning to ensure we pick up the local version
@@ -77,6 +77,11 @@ def main():
     # Shape: (Out, In) = (N, K)
     w = torch.randn(N, K, device=device, dtype=torch.bfloat16)
 
+    # Reference computation (BF16)
+    print("[INFO] Computing reference BF16 matmul...")
+    ref_out = torch.matmul(x, w.t())
+    print(f"[INFO] Reference Output - Max: {ref_out.abs().max().item():.6f}, Mean: {ref_out.abs().mean().item():.6f}")
+
     print("[INFO] Quantizing and Swizzling weights...")
     w_q_sw, w_s_sw = None, None
 
@@ -143,6 +148,11 @@ def main():
                 out_eager = model(x, w_q_sw, w_s_sw)
                 print("[SUCCESS] Eager execution worked!")
                 print(f"Output shape: {out_eager.shape}")
+
+                # Correctness check
+                diff = (out_eager - ref_out).abs()
+                print(f"[INFO] Eager vs Reference - Max Diff: {diff.max().item():.6f}, Mean Diff: {diff.mean().item():.6f}")
+
             except Exception as e:
                 print(f"[ERROR] Eager execution failed: {e}")
                 raise e
@@ -154,6 +164,10 @@ def main():
                 print("Running warmup...")
                 out_c = compiled_model(x, w_q_sw, w_s_sw)
                 print("[SUCCESS] Compiled execution (warmup) worked!")
+
+                # Correctness check
+                diff_c = (out_c - ref_out).abs()
+                print(f"[INFO] Compiled vs Reference - Max Diff: {diff_c.max().item():.6f}, Mean Diff: {diff_c.mean().item():.6f}")
 
                 print("Running benchmark...")
                 for _ in range(5):

@@ -144,23 +144,23 @@ def main():
         except Exception as e:
             print(f"[ERROR] Eager execution failed: {e}")
 
-        print("\n[INFO] Testing torch.compile on matmul_ogs...")
-        compiled_model = torch.compile(model, backend="inductor", mode="reduce-overhead")
+        # print("\n[INFO] Testing torch.compile on matmul_ogs...")
+        # compiled_model = torch.compile(model, backend="inductor", mode="reduce-overhead")
 
-        try:
-            print("Running warmup...")
-            out_c = compiled_model(x, w_q_sw, w_s_sw)
-            print("[SUCCESS] Compiled execution (warmup) worked!")
+        # try:
+        #     print("Running warmup...")
+        #     out_c = compiled_model(x, w_q_sw, w_s_sw)
+        #     print("[SUCCESS] Compiled execution (warmup) worked!")
 
-            print("Running benchmark...")
-            for _ in range(5):
-                out_c = compiled_model(x, w_q_sw, w_s_sw)
-            print("[SUCCESS] Compiled execution benchmark worked!")
+        #     print("Running benchmark...")
+        #     for _ in range(5):
+        #         out_c = compiled_model(x, w_q_sw, w_s_sw)
+        #     print("[SUCCESS] Compiled execution benchmark worked!")
 
-        except Exception as e:
-            print(f"[ERROR] Compiled execution failed: {e}")
-            import traceback
-            traceback.print_exc()
+        # except Exception as e:
+        #     print(f"[ERROR] Compiled execution failed: {e}")
+        #     import traceback
+        #     traceback.print_exc()
 
     except Exception as e:
         print(f"[ERROR] Setup failed: {e}")
