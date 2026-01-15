@@ -1,6 +1,5 @@
 torch
 transformers
-triton
 kernels
 accelerate
 pytest
