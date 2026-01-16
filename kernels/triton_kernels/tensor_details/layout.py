@@ -20,8 +20,9 @@ __all__ = [
 
 def make_default_matmul_mxfp4_w_layout(mx_axis: int):
     if cuda_capability_geq(10):
-        # return StridedLayout, dict()
-        return BlackwellMXValueLayout, dict()
+        print("WARNING: Swizzling is disabled for Blackwell")
+        return StridedLayout, dict()
+        # return BlackwellMXValueLayout, dict()
     elif cuda_capability_geq(9):
         return HopperMXValueLayout, {"mx_axis": mx_axis}
     else:
@@ -33,7 +34,8 @@ def make_default_matmul_mxfp4_w_scale_layout(mx_axis: int, num_warps: int = 8):
         return CDNA4MXScaleLayout, dict()
     else:
         if cuda_capability_geq(10):
-            return BlackwellMXScaleLayout, dict()
+            return StridedLayout, dict()
+            # return BlackwellMXScaleLayout, dict()
         elif cuda_capability_geq(9):
             return HopperMXScaleLayout, {"mx_axis": mx_axis, "num_warps": num_warps}
 
