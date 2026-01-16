@@ -38,6 +38,17 @@ def define_kernel(src, module, attrs=None, **extra_globals):
 
     gdict = dict(**(_empty_fn.__globals__))
     gdict.update(extra_globals)
+
+    # Monkeypatch CodeGenerator.builtin_namespace for any JITFunctions in globals
+    # This is a workaround for torch.compile failing to resolve global helper functions
+    try:
+        from triton.compiler.code_generator import CodeGenerator
+        for key, value in extra_globals.items():
+            if isinstance(value, triton.runtime.jit.JITFunction):
+                CodeGenerator.builtin_namespace[key] = value
+    except ImportError:
+        pass
+
     f = types.FunctionType(_empty_fn.__code__, gdict)
     f.__module__ = module.__name__
 
