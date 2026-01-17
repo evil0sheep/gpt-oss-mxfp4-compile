@@ -10,20 +10,28 @@ import inspect
 def main():
     print("--- Testing MXFP4 Matmul Kernel loading ---")
 
-    # 1. Load the kernels hub
+    # 1. Load the kernels hub from installed package
     try:
-        from kernels import get_kernel
-        print("[INFO] Successfully imported 'kernels'")
-    except ImportError:
-        print("[ERROR] Could not import 'kernels'. Is it installed?")
+        import triton_kernels
+        import triton_kernels.matmul_ogs
+        import triton_kernels.swiglu
+        import triton_kernels.routing
+        import triton_kernels.tensor
+        import triton_kernels.tensor_details
+        import triton_kernels.numerics_details
+        try:
+            import triton_kernels.numerics_details.mxfp
+        except ImportError:
+            pass
+
+        print("[INFO] Successfully imported 'triton_kernels' and submodules")
+    except ImportError as e:
+        print(f"[ERROR] Could not import 'triton_kernels'. Is it installed? {e}")
         return
 
-    REPO_ID = "kernels-community/triton_kernels"
-    print(f"[INFO] Loading kernel repo: {REPO_ID}")
-
-    # This downloads/caches the code from HF Hub
-    hub = get_kernel(REPO_ID)
-    print(f"[INFO] Hub loaded: {hub}")
+    # Use the installed package as the hub
+    hub = triton_kernels
+    print(f"[INFO] Hub loaded from installed package: {hub}")
 
     # 2. Inspect the source for the known bug
     if hasattr(hub, "matmul_ogs"):
@@ -81,8 +89,6 @@ def main():
     # We need to construct a RoutingData object expected by the kernel.
     # We can try to instantiate the class from the hub.
     try:
-        RoutingData = hub.routing.RoutingData
-
         # Mock routing: 1 token, routed to expert 0
         # This part requires knowing the exact __init__ of RoutingData which we don't see.
         # However, looking at usage, it usually takes tensors.
@@ -93,28 +99,31 @@ def main():
 
         if hasattr(hub, "swiglu"):
             print("\n[INFO] Testing 'swiglu' kernel (simpler fallback)...")
-            swiglu_fn = hub.swiglu.swiglu_fn
-
-            # Swiglu inputs: X
-            # Output: Y
-            # It usually splits last dim in 2.
-            x_swiglu = torch.randn(M, K * 2, device=device, dtype=torch.bfloat16)
-
-            # Need FnSpecs?
-            # transformers usage:
-            # FnSpecs = triton_kernels_hub.matmul_ogs.FnSpecs
-            # FusedActivation(FnSpecs("swiglu", swiglu_fn, ...))
-
-            # Direct call?
-            # swiglu_fn might be a triton kernel (JIT).
-
-            # Let's try calling it directly
             try:
-                out = swiglu_fn(x_swiglu)
-                print("[SUCCESS] swiglu_fn execution worked!")
+                swiglu_fn = hub.swiglu.swiglu_fn
+
+                # Swiglu inputs: X
+                # Output: Y
+                # It usually splits last dim in 2.
+                x_swiglu = torch.randn(M, K * 2, device=device, dtype=torch.bfloat16)
+
+                # Need FnSpecs?
+                # transformers usage:
+                # FnSpecs = triton_kernels_hub.matmul_ogs.FnSpecs
+                # FusedActivation(FnSpecs("swiglu", swiglu_fn, ...))
+
+                # Direct call?
+                # swiglu_fn might be a triton kernel (JIT).
+
+                # Let's try calling it directly
+                try:
+                    out = swiglu_fn(x_swiglu)
+                    print("[SUCCESS] swiglu_fn execution worked!")
+                except Exception as e:
+                     # It might need grid/args.
+                     print(f"[INFO] Direct swiglu call failed (expected for raw kernel): {e}")
             except Exception as e:
-                 # It might need grid/args.
-                 print(f"[INFO] Direct swiglu call failed (expected for raw kernel): {e}")
+                 print(f"[WARN] Accessing swiglu_fn failed: {e}")
 
         # Try matmul_ogs
         print("\n[INFO] Invoking matmul_ogs...")
@@ -164,6 +173,8 @@ def main():
 
     except Exception as e:
         print(f"[ERROR] Setup failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
