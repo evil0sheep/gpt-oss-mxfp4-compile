@@ -7,6 +7,10 @@ import time
 import numpy as np
 import torch
 
+# Set compile threads to 1 to avoid subprocess isolation issues with monkeypatched kernels
+import torch._inductor.config
+torch._inductor.config.compile_threads = 1
+
 # Add deps/transformers/src to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 transformers_path = os.path.join(current_dir, "deps", "transformers", "src")
