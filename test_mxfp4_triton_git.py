@@ -4,22 +4,8 @@ import os
 import sys
 import inspect
 
-# Add local triton kernels to path
-# The structure is kernels/triton_kernels
-# So we add kernels to sys.path to be able to import triton_kernels
-repo_root = os.path.dirname(os.path.abspath(__file__))
-triton_kernels_path = os.path.join(repo_root, "kernels")
-
-if os.path.exists(triton_kernels_path):
-    # Insert at beginning to ensure we pick up the local version
-    sys.path.insert(0, triton_kernels_path)
-    print(f"[INFO] Added {triton_kernels_path} to sys.path")
-else:
-    print(f"[ERROR] Path {triton_kernels_path} does not exist!")
-    sys.exit(1)
-
 def main():
-    print("--- Testing MXFP4 Matmul Kernel loading from LOCAL GIT REPO ---")
+    print("--- Testing MXFP4 Matmul Kernel loading from INSTALLED PACKAGE ---")
 
     try:
         import triton_kernels
