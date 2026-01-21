@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-import sys
+from kernels.include import unswizzle_mx_scale_bw
 
 def get_cuda_autotune_config():
     return [
@@ -30,14 +30,6 @@ def matmul_mxfp4_kernel(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
 ):
-    """
-    Kernel for computing Matmul with MXFP4 weights and FP8 inputs.
-    A: [M, K]  (FP8 e4m3fn)
-    B: [N, K]  (Unpacked FP4 -> stored as uint8 [N, K])
-    C: [M, N]  (BF16)
-
-    Scales are per block of 32 elements in K dimension.
-    """
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -48,87 +40,106 @@ def matmul_mxfp4_kernel(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Block offsets
-    offs_am = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
-    offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
+    # -----------------------------------------------------------
+    # Offsets
+    # -----------------------------------------------------------
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % N
 
-    # We iterate over K
-    # BLOCK_K must be multiple of 32 for scaling blocks
-    # BLOCK_K must be multiple of 2 for packing
+    # -----------------------------------------------------------
+    # B Scales Offsets (Blackwell)
+    # -----------------------------------------------------------
+    MX_PACK_DIVISOR: tl.constexpr = 32
+    MX_SCALE_BLOCK_K: tl.constexpr = BLOCK_K // MX_PACK_DIVISOR
+    PACKED_MX_BLOCK: tl.constexpr = (MX_SCALE_BLOCK_K // 4) * 32 * 4 * 4
+    SCALE_BLOCK_N: tl.constexpr = BLOCK_N // 128
 
-    # Pointers for A
-    # A shape [M, K]
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am)
+    # Offset for N-blocks of scales
+    offs_n_scale = (pid_n * SCALE_BLOCK_N + tl.arange(0, SCALE_BLOCK_N))
 
-    # Pointers for B
-    # B: [N, K] (unpacked for fallback)
-    b_ptrs = b_ptr + (offs_bn[:, None] * stride_bn)
+    # Pointers
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am)
+    a_scale_ptrs = a_scales_ptr + (offs_m[:, None] * stride_asm)
 
-    # Scales
-    # A scales: [M, K/32]
-    a_scale_ptrs = a_scales_ptr + (offs_am[:, None] * stride_asm)
-    # B scales: [N, K/32]
-    b_scale_ptrs = b_scales_ptr + (offs_bn[:, None] * stride_bsn)
+    # Base pointer for B scales (swizzled)
+    # Stride bsn should jump between N-blocks
+    b_scale_ptrs_base = b_scales_ptr + (offs_n_scale[:, None] * stride_bsn)
 
-    # Accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        # Calculate offsets for this K block
-        k_start = k * BLOCK_K
+    for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+        k_start = k_idx * BLOCK_K
 
-        # --- Load A ---
+        # --- Load A [BLOCK_M, BLOCK_K] ---
         offs_k = k_start + tl.arange(0, BLOCK_K)
-        # Check boundaries if K not multiple of BLOCK_K? assume aligned for now.
-        a = tl.load(a_ptrs + offs_k[None, :] * stride_ak)
+        a_ptr_k = a_ptrs + (offs_k[None, :] * stride_ak)
+        a = tl.load(a_ptr_k, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
 
-        # --- Load B ---
-        # B is unpacked [N, K] for this fallback
-        b = tl.load(b_ptrs + offs_k[None, :] * stride_bk)
+        # --- Load B [BLOCK_K/2, BLOCK_N] ---
+        # B is [N, K/2]. We load as [BLOCK_N, BLOCK_K/2] then transpose logic implicitly by pointer mapping?
+        # We want `b` tensor to be [BLOCK_K/2, BLOCK_N] for dot_scaled.
+        # Maps to: A [M, K] * B_scaled [K, N]
+        # B packed is [BLOCK_K/2, BLOCK_N].
+        # In memory B is [N, K/2].
+        # Ptr = base + offs_n * stride_bn + offs_k_packed * stride_bk
+        offs_k_packed = (k_start // 2) + tl.arange(0, BLOCK_K // 2)
+        b_ptr_k = b_ptr + (offs_n[None, :] * stride_bn) + (offs_k_packed[:, None] * stride_bk)
+        b = tl.load(b_ptr_k, mask=(offs_n[None, :] < N) & (offs_k_packed[:, None] < K // 2), other=0.0)
 
-        # --- Load Scales ---
-        # Scale block size is 32.
-        # We broadcast scales to match [BLOCK_M/N, BLOCK_K]
-        offs_k_scale_repeated = ((k_start + tl.arange(0, BLOCK_K)) // 32)
+        # --- Load A Scales [BLOCK_M, BLOCK_K/32] ---
+        offs_k_scale_a = (k_start // 32) + tl.arange(0, BLOCK_K // 32)
+        a_scale_ptr_k = a_scale_ptrs + (offs_k_scale_a[None, :] * stride_ask)
+        a_scales = tl.load(a_scale_ptr_k, mask=(offs_m[:, None] < M) & (offs_k_scale_a[None, :] < K // 32), other=1)
 
-        a_scale = tl.load(a_scale_ptrs + offs_k_scale_repeated[None, :] * stride_ask)
-        b_scale = tl.load(b_scale_ptrs + offs_k_scale_repeated[None, :] * stride_bsk)
+        # --- Load B Scales (Blackwell Swizzled) ---
+        # Stride bsk assumed 1
+        offs_k_scale_b = PACKED_MX_BLOCK * k_idx + tl.arange(0, PACKED_MX_BLOCK)
+        b_scale_ptrs_now = b_scale_ptrs_base + (offs_k_scale_b[None, :] * stride_bsk)
+        b_scales_packed = tl.load(b_scale_ptrs_now)
+        b_scales = unswizzle_mx_scale_bw(b_scales_packed)
 
-        # --- Dot Product ---
-        # Fallback to standard dot with cast
+        # --- Dot Scaled ---
+        acc = tl.dot_scaled(
+            a, a_scales, "e4m3",
+            b, b_scales, "e2m1",
+            acc=acc,
+        )
 
-        # Dequantize A (simplistic)
-        a_bf16 = a.to(tl.bfloat16) * a_scale.to(tl.bfloat16)
-
-        # Dequantize B (simplistic)
-        # Treating uint8 as if it was the value for now (or cast to bf16)
-        b_bf16 = b.to(tl.bfloat16) * b_scale.to(tl.bfloat16)
-
-        acc = tl.dot(a_bf16, tl.trans(b_bf16), acc=acc)
-
-    # Store Output
+    # Store
     offs_cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, acc.to(tl.bfloat16), mask=c_mask)
+    mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, acc.to(tl.bfloat16), mask=mask_c)
 
 def matmul_mxfp4(a, b, scales_a, scales_b):
     """
     a: [M, K] float8_e4m3fn
-    b: [N, K] uint8 (unpacked float4_e2m1 for fallback)
-    scales_a: [M, K//32] float8_e8m0 (uint8)
-    scales_b: [N, K//32] float8_e8m0 (uint8)
+    b: [N, K/2] uint8 (packed float4_e2m1)
+    scales_a: [M, K//32] uint8
+    scales_b: [N_blocks, ...] Swizzled B scales
     """
     M, K = a.shape
-    N, K_unpacked = b.shape
-    # assert K_packed * 2 == K, "B last dim must be K/2"
+    N = b.shape[0]
+
+    # Handle strides for swizzled scales_b
+    if scales_b.ndim == 5:
+        # Assumed shape (1, N_blocks, K_chunks, 2, 256)
+        stride_bsn = scales_b.stride(1)
+        stride_bsk = 1
+    elif scales_b.ndim == 2:
+        # Fallback if passed as 2D
+        stride_bsn = scales_b.stride(0)
+        stride_bsk = scales_b.stride(1)
+    else:
+        # Try to guess or default (e.g. if flattened or 1D)
+        # Assuming last dim is contiguous
+        stride_bsk = 1
+        # If we can't determine N stride, we might error, but let's try stride(0) if available
+        stride_bsn = scales_b.stride(0) if scales_b.ndim > 0 else 1
 
     c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
 
-    # Grid
-    # grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), )
-    # Let autotune handle it usually, but we need to provide grid function if not using default
     def grid(META):
         return (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']), )
 
@@ -140,6 +151,6 @@ def matmul_mxfp4(a, b, scales_a, scales_b):
         b.stride(0), b.stride(1),
         c.stride(0), c.stride(1),
         scales_a.stride(0), scales_a.stride(1),
-        scales_b.stride(0), scales_b.stride(1),
+        stride_bsn, stride_bsk,
     )
     return c
