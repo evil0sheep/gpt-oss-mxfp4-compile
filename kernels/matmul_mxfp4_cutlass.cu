@@ -220,7 +220,7 @@ void run_w4a4_original(
           cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
           ElementAccumulator, ElementC, LayoutC*, AlignmentC, ElementD,
           LayoutD*, AlignmentD,
-          cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm,
+          cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative,
           FusionOperation>::CollectiveOp;
 
   using CollectiveMainloop =
@@ -229,7 +229,7 @@ void run_w4a4_original(
           LayoutB*, AlignmentB, ElementAccumulator, MmaTileShape, ClusterShape,
           cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
               sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmMxf8f6f4Sm100>::CollectiveOp;
+          cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative>::CollectiveOp;
 
   using GemmKernel =
       cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop,
@@ -463,7 +463,6 @@ void run_get_group_gemm_starts_w4a8(
   }
 }
 
-template <typename ElementA, typename ElementB, typename ElementC>
 void run_w4a8_group_mm_sm120(
     torch::Tensor& output, const torch::Tensor& a, const torch::Tensor& b,
     const torch::Tensor& a_blockscale, const torch::Tensor& b_blockscales,
@@ -471,6 +470,10 @@ void run_w4a8_group_mm_sm120(
     const torch::Tensor& expert_offsets, const torch::Tensor& sf_offsets, int M,
     int N, int K) {
   
+  using ElementA = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+  using ElementB = cutlass::mx_float4_t<cutlass::float_e2m1_t>;
+  using ElementC = cutlass::bfloat16_t;
+
   using ScalarA = typename ElementA::DataType;
   using ScalarB = typename ElementB::DataType;
   using ElementSFA = typename ElementA::ScaleFactorType;
@@ -496,7 +499,7 @@ void run_w4a8_group_mm_sm120(
   static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
   static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
-  using ArchTag = cutlass::arch::Sm100;
+  using ArchTag = cutlass::arch::Sm120;
   using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
 
   using ClusterShape = Shape<_1, _1, _1>;
@@ -511,7 +514,7 @@ void run_w4a8_group_mm_sm120(
           cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
           ElementAccumulator, ElementC, LayoutC*, AlignmentC, ElementD,
           LayoutD*, AlignmentD,
-          cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm,
+          cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative,
           FusionOperation>::CollectiveOp;
 
   using CollectiveMainloop =
@@ -520,7 +523,7 @@ void run_w4a8_group_mm_sm120(
           LayoutB*, AlignmentB, ElementAccumulator, MmaTileShape, ClusterShape,
           cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
               sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmMxf8f6f4Sm100>::CollectiveOp;
+          cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative>::CollectiveOp;
 
   using GemmKernel =
       cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop,
@@ -708,18 +711,9 @@ void cutlass_fp4_group_mm(
             expert_offsets, sf_offsets, M, N, K);
   } else {
       // W4A8 Mode (MXFP8 x MXFP4) -> Use New Function
-      using ElementA = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
-      using ElementB = cutlass::mx_float4_t<cutlass::float_e2m1_t>;
-
-      if (output.scalar_type() == torch::kBFloat16) {
-          run_w4a8_group_mm_sm120<ElementA, ElementB, cutlass::bfloat16_t>(
+      run_w4a8_group_mm_sm120(
             output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
             expert_offsets, sf_offsets, M, N, K);
-      } else {
-          run_w4a8_group_mm_sm120<ElementA, ElementB, cutlass::half_t>(
-            output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes,
-            expert_offsets, sf_offsets, M, N, K);
-      }
   }
 #else
   TORCH_CHECK_NOT_IMPLEMENTED(false, "No compiled cutlass_fp4_group_mm kernel.");
