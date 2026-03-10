@@ -645,6 +645,110 @@ void run_w4a8_group_mm_sm120(
 }
 
 // =================================================================================================
+// SCALE LAYOUT CONVERSION HELPERS
+// =================================================================================================
+
+// Convert scale factors from row-major [rows, k_groups] to the blocked layout
+// expected by CUTLASS's block-scaled MMA. Uses the same ScaleConfig as the W4A8 kernel.
+// The CUTLASS TMA pipeline expects scale factors in a specific blocked/tiled layout
+// defined by tile_atom_to_shape_SFA/SFB, NOT simple row-major.
+
+template <bool IsSFA>
+torch::Tensor convert_scales_w4a8_impl(
+    const torch::Tensor& scales_rowmajor, // [rows, k_groups] uint8 on CPU or GPU
+    int M, int N, int K) {
+
+  using ElementA = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+  using ElementB = cutlass::mx_float4_t<cutlass::float_e2m1_t>;
+  using ElementC = cutlass::bfloat16_t;
+  using ElementD = ElementC;
+  using ElementAccumulator = float;
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using LayoutC = cutlass::layout::RowMajor;
+  using LayoutD = LayoutC;
+
+  static constexpr int AlignmentA = 16;
+  static constexpr int AlignmentB = 32;
+  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+  static constexpr int AlignmentD = AlignmentC;
+
+  using ArchTag = cutlass::arch::Sm120;
+  using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using MmaTileShape = Shape<_128, _128, _128>;
+  using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int32_t, int32_t, int32_t>>;
+
+  using FusionOperation = cutlass::epilogue::fusion::LinearCombination<
+      ElementD, ElementAccumulator, ElementC, ElementAccumulator>;
+
+  using CollectiveEpilogue =
+      typename cutlass::epilogue::collective::CollectiveBuilder<
+          ArchTag, OperatorClass, MmaTileShape, ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
+          ElementAccumulator, ElementC, LayoutC*, AlignmentC, ElementD,
+          LayoutD*, AlignmentD,
+          cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative,
+          FusionOperation>::CollectiveOp;
+
+  using CollectiveMainloop =
+      typename cutlass::gemm::collective::CollectiveBuilder<
+          ArchTag, OperatorClass, ElementA, LayoutA*, AlignmentA, ElementB,
+          LayoutB*, AlignmentB, ElementAccumulator, MmaTileShape, ClusterShape,
+          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+              sizeof(typename CollectiveEpilogue::SharedStorage))>,
+          cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative>::CollectiveOp;
+
+  using GemmKernel =
+      cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop,
+                                           CollectiveEpilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  using ScaleConfig =
+      typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+
+  auto problem_shape = cute::make_shape(M, N, K, 1);
+  auto layout = [&]() {
+    if constexpr (IsSFA) {
+      return ScaleConfig::tile_atom_to_shape_SFA(problem_shape);
+    } else {
+      return ScaleConfig::tile_atom_to_shape_SFB(problem_shape);
+    }
+  }();
+
+  int rows = IsSFA ? M : N;
+  int sf_vec_size = ScaleConfig::SFVecSize;
+  int k_groups = K / sf_vec_size;
+  int buffer_size = static_cast<int>(cute::cosize(layout));
+
+  // Work on CPU for simplicity (this is a test helper, not perf-critical)
+  auto scales_cpu = scales_rowmajor.to(torch::kCPU).contiguous();
+  auto out_cpu = torch::zeros({buffer_size}, torch::TensorOptions().dtype(torch::kUInt8));
+  auto* in_ptr = scales_cpu.data_ptr<uint8_t>();
+  auto* out_ptr = out_cpu.data_ptr<uint8_t>();
+
+  for (int r = 0; r < rows; r++) {
+    for (int kg = 0; kg < k_groups; kg++) {
+      // CuTe layout maps (row, k_group_within_sf, L) to flat offset
+      // K coordinate in the layout is kg * sf_vec_size (element-space K)
+      auto offset = layout(r, kg * sf_vec_size, 0);
+      out_ptr[offset] = in_ptr[r * k_groups + kg];
+    }
+  }
+
+  return out_cpu.to(scales_rowmajor.device());
+}
+
+torch::Tensor convert_a_scales_for_w4a8(
+    const torch::Tensor& scales_rowmajor, int M, int N, int K) {
+  return convert_scales_w4a8_impl<true>(scales_rowmajor, M, N, K);
+}
+
+torch::Tensor convert_b_scales_for_w4a8(
+    const torch::Tensor& scales_rowmajor, int M, int N, int K) {
+  return convert_scales_w4a8_impl<false>(scales_rowmajor, M, N, K);
+}
+
+// =================================================================================================
 // MAIN DISPATCHER
 // =================================================================================================
 
@@ -723,4 +827,8 @@ void cutlass_fp4_group_mm(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cutlass_fp4_group_mm", &cutlass_fp4_group_mm,
         "CUTLASS FP4 Grouped GEMM");
+  m.def("convert_a_scales_for_w4a8", &convert_a_scales_for_w4a8,
+        "Convert A scales from row-major to CUTLASS blocked layout for W4A8");
+  m.def("convert_b_scales_for_w4a8", &convert_b_scales_for_w4a8,
+        "Convert B scales from row-major to CUTLASS blocked layout for W4A8");
 }
