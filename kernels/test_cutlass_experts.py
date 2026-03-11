@@ -841,6 +841,124 @@ def test_batched_scale_conversion():
 
 
 # =====================================================================
+# Test 11: GPU-side scale conversion consistency
+# =====================================================================
+
+def test_gpu_scale_conversion():
+    """Verify GPU batch_convert_a_scales matches CPU batch_convert_a_scales."""
+    print("\n=== Test 11: GPU vs CPU scale conversion ===")
+
+    cutlass_experts_mod.ensure_custom_op_registered()
+    ext = cutlass_experts_mod.get_cutlass_extension()
+    device = torch.device("cuda")
+
+    N, K = 256, 512
+    k_groups = K // 32
+    num_experts = 4
+    tokens_per_expert = [64, 0, 128, 32]
+    total_tokens = sum(tokens_per_expert)
+
+    torch.manual_seed(42)
+    scales = torch.randint(0, 256, (total_tokens, k_groups), device=device, dtype=torch.uint8)
+
+    expert_counts = torch.tensor(tokens_per_expert, device=device, dtype=torch.int32)
+    expert_offsets = torch.zeros(num_experts, device=device, dtype=torch.int32)
+    torch.cumsum(expert_counts[:-1], dim=0, out=expert_offsets[1:])
+
+    # CPU batched conversion (reference)
+    cpu_blocked, cpu_sf = ext.batch_convert_a_scales_for_w4a8(
+        scales, expert_counts, expert_offsets, N, K
+    )
+
+    # GPU conversion
+    gpu_blocked, gpu_sf = ext.batch_convert_a_scales_for_w4a8_gpu(
+        scales, expert_counts, expert_offsets, N, K
+    )
+    torch.cuda.synchronize()
+
+    assert cpu_blocked.shape == gpu_blocked.shape, \
+        f"Shape mismatch: CPU {cpu_blocked.shape} vs GPU {gpu_blocked.shape}"
+    assert (cpu_blocked == gpu_blocked).all(), "GPU scale conversion differs from CPU"
+    assert (cpu_sf == gpu_sf).all(), "GPU sf offsets differ from CPU"
+
+    print(f"  {num_experts} experts, tokens={tokens_per_expert}: exact match")
+    print("  [PASS]")
+
+
+# =====================================================================
+# Test 12: Fused MoE routing
+# =====================================================================
+
+def test_fused_routing():
+    """Verify fused_moe_routing produces same final result as argsort-based routing."""
+    print("\n=== Test 12: Fused MoE routing ===")
+
+    cutlass_experts_mod.ensure_custom_op_registered()
+    ext = cutlass_experts_mod.get_cutlass_extension()
+    device = torch.device("cuda")
+
+    num_tokens = 128
+    num_experts = 32
+    top_k = 4
+
+    torch.manual_seed(42)
+    router_logits = torch.randn(num_tokens, num_experts, device=device)
+    routing_weights, router_indices = torch.topk(router_logits, top_k, dim=-1)
+    routing_weights = torch.softmax(routing_weights, dim=-1)
+
+    # --- Reference: argsort-based routing ---
+    flat_expert_idx = router_indices.reshape(-1)
+    flat_weights = routing_weights.reshape(-1)
+    flat_token_idx = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1, top_k).reshape(-1)
+
+    sorted_order = torch.argsort(flat_expert_idx, stable=True)
+    ref_sorted_expert = flat_expert_idx[sorted_order]
+    ref_sorted_token = flat_token_idx[sorted_order]
+    ref_sorted_weights = flat_weights[sorted_order]
+
+    ref_counts = torch.zeros(num_experts, device=device, dtype=torch.int32)
+    ref_counts.scatter_add_(0, ref_sorted_expert.to(torch.int64),
+                            torch.ones_like(ref_sorted_expert, dtype=torch.int32))
+    ref_offsets = torch.zeros(num_experts, device=device, dtype=torch.int32)
+    torch.cumsum(ref_counts[:-1], dim=0, out=ref_offsets[1:])
+
+    # --- Fused routing ---
+    fused_token, fused_expert, fused_weights, fused_counts, fused_offsets = \
+        ext.fused_moe_routing(router_indices, routing_weights, num_experts)
+
+    # Expert counts and offsets must match exactly
+    assert (fused_counts == ref_counts).all(), "Expert counts differ"
+    assert (fused_offsets == ref_offsets).all(), "Expert offsets differ"
+
+    # Token order within expert groups may differ (atomic ordering),
+    # so verify equivalence via scatter_add on a test signal
+    hidden = 64
+    test_data = torch.randn(num_tokens, hidden, device=device, dtype=torch.bfloat16)
+
+    # Reference scatter
+    ref_gathered = test_data[ref_sorted_token]
+    ref_weighted = (ref_gathered * ref_sorted_weights.unsqueeze(-1)).to(torch.bfloat16)
+    ref_result = torch.zeros(num_tokens, hidden, device=device, dtype=torch.bfloat16)
+    ref_result.scatter_add_(0, ref_sorted_token.unsqueeze(-1).expand(-1, hidden), ref_weighted)
+
+    # Fused scatter
+    fused_gathered = test_data[fused_token]
+    fused_weighted = (fused_gathered * fused_weights.unsqueeze(-1)).to(torch.bfloat16)
+    fused_result = torch.zeros(num_tokens, hidden, device=device, dtype=torch.bfloat16)
+    fused_result.scatter_add_(0, fused_token.unsqueeze(-1).expand(-1, hidden), fused_weighted)
+
+    diff = (ref_result.float() - fused_result.float()).abs().max().item()
+    rel_err = (ref_result.float() - fused_result.float()).abs().mean().item() / \
+              (ref_result.float().abs().mean().item() + 1e-8)
+
+    print(f"  Scatter result max diff: {diff:.6f}")
+    print(f"  Scatter result rel err: {rel_err:.6f}")
+    # Small diff possible from bf16 addition order
+    assert rel_err < 0.01, f"Fused routing result differs: rel_err={rel_err}"
+    print("  [PASS]")
+
+
+# =====================================================================
 # Profile: Per-step timing of forward pass
 # =====================================================================
 
@@ -956,6 +1074,8 @@ def main():
     test_3d_input(downcast, upcast)
     test_k_padding(downcast, upcast)
     test_batched_scale_conversion()
+    test_gpu_scale_conversion()
+    test_fused_routing()
     profile_forward(downcast, upcast)
 
     print("\n" + "=" * 65)

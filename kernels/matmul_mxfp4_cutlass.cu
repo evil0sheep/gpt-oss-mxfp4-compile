@@ -873,6 +873,228 @@ std::tuple<torch::Tensor, torch::Tensor> batch_convert_a_scales_for_w4a8(
 }
 
 // =================================================================================================
+// GPU-SIDE SCALE CONVERSION (eliminates CPU round-trip for scale data)
+// =================================================================================================
+
+// GPU kernel: each block handles one expert's scale conversion.
+// Uses CuTe layout functions on-device (all marked CUTE_HOST_DEVICE).
+template <typename ScaleConfig>
+__global__ void convert_a_scales_gpu_kernel(
+    const uint8_t* __restrict__ in,           // [total_tokens, k_groups] row-major
+    uint8_t* __restrict__ out,                // [total_out_size] blocked layout
+    const int32_t* __restrict__ expert_counts,  // [E]
+    const int32_t* __restrict__ expert_offsets,  // [E] token offsets in input
+    const int32_t* __restrict__ out_offsets,     // [E] byte offsets in output
+    int N, int K, int k_groups) {
+
+  int expert_id = blockIdx.x;
+  int m = expert_counts[expert_id];
+  if (m == 0) return;
+
+  constexpr int sf_vec_size = ScaleConfig::SFVecSize;
+  auto problem_shape = cute::make_shape(m, N, K, 1);
+  auto layout = ScaleConfig::tile_atom_to_shape_SFA(problem_shape);
+
+  int in_base = expert_offsets[expert_id] * k_groups;
+  int out_base = out_offsets[expert_id];
+
+  int total_elements = m * k_groups;
+  for (int i = threadIdx.x; i < total_elements; i += blockDim.x) {
+    int r = i / k_groups;
+    int kg = i % k_groups;
+    out[out_base + layout(r, kg * sf_vec_size, 0)] =
+        in[in_base + r * k_groups + kg];
+  }
+}
+
+// Host function: computes layout cosizes on CPU (just template math on 32 ints),
+// then launches GPU kernel to permute scale data without transferring it to CPU.
+std::tuple<torch::Tensor, torch::Tensor> batch_convert_a_scales_for_w4a8_gpu(
+    const torch::Tensor& scales_rowmajor,  // [total_tokens, k_groups] uint8 on GPU
+    const torch::Tensor& expert_counts_t,  // [E] int32 on GPU
+    const torch::Tensor& expert_offsets_t, // [E] int32 on GPU
+    int N, int K) {
+
+  // W4A8 type chain to derive ScaleConfig
+  using ElementA = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+  using ElementB = cutlass::mx_float4_t<cutlass::float_e2m1_t>;
+  using ElementC = cutlass::bfloat16_t;
+  using ElementD = ElementC;
+  using ElementAccumulator = float;
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using LayoutC = cutlass::layout::RowMajor;
+  using LayoutD = LayoutC;
+  static constexpr int AlignmentA = 16;
+  static constexpr int AlignmentB = 32;
+  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+  static constexpr int AlignmentD = AlignmentC;
+  using ArchTag = cutlass::arch::Sm120;
+  using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using MmaTileShape = Shape<_128, _128, _128>;
+  using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int32_t, int32_t, int32_t>>;
+  using FusionOperation = cutlass::epilogue::fusion::LinearCombination<
+      ElementD, ElementAccumulator, ElementC, ElementAccumulator>;
+  using CollectiveEpilogue =
+      typename cutlass::epilogue::collective::CollectiveBuilder<
+          ArchTag, OperatorClass, MmaTileShape, ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
+          ElementAccumulator, ElementC, LayoutC*, AlignmentC, ElementD,
+          LayoutD*, AlignmentD,
+          cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative,
+          FusionOperation>::CollectiveOp;
+  using CollectiveMainloop =
+      typename cutlass::gemm::collective::CollectiveBuilder<
+          ArchTag, OperatorClass, ElementA, LayoutA*, AlignmentA, ElementB,
+          LayoutB*, AlignmentB, ElementAccumulator, MmaTileShape, ClusterShape,
+          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+              sizeof(typename CollectiveEpilogue::SharedStorage))>,
+          cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative>::CollectiveOp;
+  using GemmKernel =
+      cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop,
+                                           CollectiveEpilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  using ScaleConfig =
+      typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+
+  auto device = scales_rowmajor.device();
+  int num_experts = static_cast<int>(expert_counts_t.size(0));
+  int sf_vec_size = ScaleConfig::SFVecSize;
+  int k_groups = K / sf_vec_size;
+
+  // Transfer only expert counts to CPU for cosize computation (E ints, not the full scales)
+  auto counts_cpu = expert_counts_t.to(torch::kCPU);
+  auto* counts = counts_cpu.data_ptr<int32_t>();
+
+  // Compute per-expert output offsets on CPU (CuTe template math, instant)
+  std::vector<int32_t> out_offsets_vec(num_experts);
+  int64_t total_out = 0;
+  for (int i = 0; i < num_experts; i++) {
+    out_offsets_vec[i] = static_cast<int32_t>(total_out);
+    int m = counts[i];
+    if (m == 0) continue;
+    auto problem_shape = cute::make_shape(m, N, K, 1);
+    auto layout = ScaleConfig::tile_atom_to_shape_SFA(problem_shape);
+    total_out += static_cast<int64_t>(cute::cosize(layout));
+  }
+
+  if (total_out == 0) {
+    auto empty = torch::zeros({0}, torch::TensorOptions().dtype(torch::kUInt8).device(device));
+    auto sf = torch::zeros({num_experts}, torch::TensorOptions().dtype(torch::kInt32).device(device));
+    return std::make_tuple(empty, sf);
+  }
+
+  // Allocate output on GPU and upload small offset array
+  auto output = torch::zeros({total_out}, torch::TensorOptions().dtype(torch::kUInt8).device(device));
+  auto out_offsets_t = torch::tensor(out_offsets_vec,
+      torch::TensorOptions().dtype(torch::kInt32)).to(device);
+
+  // Launch kernel: one block per expert, 256 threads per block
+  auto stream = at::cuda::getCurrentCUDAStream(device.index());
+  convert_a_scales_gpu_kernel<ScaleConfig><<<num_experts, 256, 0, stream>>>(
+      scales_rowmajor.data_ptr<uint8_t>(),
+      output.data_ptr<uint8_t>(),
+      expert_counts_t.data_ptr<int32_t>(),
+      expert_offsets_t.data_ptr<int32_t>(),
+      out_offsets_t.data_ptr<int32_t>(),
+      N, K, k_groups);
+
+  return std::make_tuple(output, out_offsets_t);
+}
+
+// =================================================================================================
+// FUSED MOE ROUTING (counting sort — O(n) vs argsort O(n log n))
+// =================================================================================================
+
+__global__ void moe_histogram_kernel(
+    const int64_t* __restrict__ router_indices,  // [T * top_k] flattened
+    int32_t* __restrict__ expert_counts,         // [E] output (zero-initialized)
+    int total) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  int expert = static_cast<int>(router_indices[idx]);
+  atomicAdd(&expert_counts[expert], 1);
+}
+
+__global__ void moe_sort_kernel(
+    const int64_t* __restrict__ router_indices,   // [T * top_k]
+    const float* __restrict__ routing_weights,    // [T * top_k]
+    int64_t* __restrict__ sorted_token_idx,       // [T * top_k] output
+    int64_t* __restrict__ sorted_expert_idx,      // [T * top_k] output
+    float* __restrict__ sorted_weights,           // [T * top_k] output
+    int32_t* __restrict__ write_positions,        // [E] starts as expert_offsets, atomically incremented
+    int total, int top_k) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+
+  int expert = static_cast<int>(router_indices[idx]);
+  int token_id = idx / top_k;
+  int pos = atomicAdd(&write_positions[expert], 1);
+
+  sorted_token_idx[pos] = static_cast<int64_t>(token_id);
+  sorted_expert_idx[pos] = static_cast<int64_t>(expert);
+  sorted_weights[pos] = routing_weights[idx];
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+fused_moe_routing(
+    const torch::Tensor& router_indices,   // [T, top_k] int64
+    const torch::Tensor& routing_weights,  // [T, top_k] float32
+    int num_experts) {
+
+  int T = static_cast<int>(router_indices.size(0));
+  int top_k = static_cast<int>(router_indices.size(1));
+  int total = T * top_k;
+  auto device = router_indices.device();
+  auto stream = at::cuda::getCurrentCUDAStream(device.index());
+
+  auto flat_indices = router_indices.reshape({-1}).contiguous();
+  auto flat_weights = routing_weights.reshape({-1}).contiguous();
+
+  // Phase 1: Histogram
+  auto expert_counts = torch::zeros({num_experts},
+      torch::TensorOptions().dtype(torch::kInt32).device(device));
+
+  int block_size = 256;
+  int grid_size = (total + block_size - 1) / block_size;
+
+  moe_histogram_kernel<<<grid_size, block_size, 0, stream>>>(
+      flat_indices.data_ptr<int64_t>(),
+      expert_counts.data_ptr<int32_t>(),
+      total);
+
+  // Prefix sum for expert_offsets
+  auto expert_offsets = torch::zeros({num_experts},
+      torch::TensorOptions().dtype(torch::kInt32).device(device));
+  if (num_experts > 1) {
+    auto cumsum = expert_counts.narrow(0, 0, num_experts - 1).cumsum(0);
+    expert_offsets.narrow(0, 1, num_experts - 1).copy_(cumsum);
+  }
+
+  // Phase 2: Counting sort
+  auto write_positions = expert_offsets.clone();
+  auto sorted_token_idx = torch::empty({total},
+      torch::TensorOptions().dtype(torch::kInt64).device(device));
+  auto sorted_expert_idx = torch::empty({total},
+      torch::TensorOptions().dtype(torch::kInt64).device(device));
+  auto sorted_weights = torch::empty({total},
+      torch::TensorOptions().dtype(torch::kFloat32).device(device));
+
+  moe_sort_kernel<<<grid_size, block_size, 0, stream>>>(
+      flat_indices.data_ptr<int64_t>(),
+      flat_weights.data_ptr<float>(),
+      sorted_token_idx.data_ptr<int64_t>(),
+      sorted_expert_idx.data_ptr<int64_t>(),
+      sorted_weights.data_ptr<float>(),
+      write_positions.data_ptr<int32_t>(),
+      total, top_k);
+
+  return std::make_tuple(sorted_token_idx, sorted_expert_idx, sorted_weights,
+                         expert_counts, expert_offsets);
+}
+
+// =================================================================================================
 // MAIN DISPATCHER
 // =================================================================================================
 
@@ -957,4 +1179,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Convert B scales from row-major to CUTLASS blocked layout for W4A8");
   m.def("batch_convert_a_scales_for_w4a8", &batch_convert_a_scales_for_w4a8,
         "Batch convert A scales for all experts in one GPU<->CPU round-trip");
+  m.def("batch_convert_a_scales_for_w4a8_gpu", &batch_convert_a_scales_for_w4a8_gpu,
+        "GPU-side batch A scale conversion (no scale data transfer to CPU)");
+  m.def("fused_moe_routing", &fused_moe_routing,
+        "Fused MoE routing: counting sort O(n) with histogram + atomic placement");
 }

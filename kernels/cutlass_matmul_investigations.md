@@ -50,7 +50,7 @@ Validated against triton hub's `downcast_to_mxfp_torch` (quantization) + `upcast
 
 1. ~~**`__get_group_gemm_starts_w4a8` hardcodes `group_size=16`**~~ **FIXED.** Changed to `group_size = 32` (matching `ScaleConfig::SFVecSize`). Additionally, scale pointer calculations were overhauled: A scale offsets now use raw element offsets (not `padded_M * group_k`), and B scale offsets use `ldb_blockscale` (stride per expert in the blocked layout buffer). Validated correct with multi-expert grouped GEMM and full GPT-OSS-20B model.
 
-2. **Scale conversion optimization.** Weight scales (B) are converted once at load time — no runtime cost. Activation scales (A) are converted per-inference. **Optimization applied:** `batch_convert_a_scales_for_w4a8()` performs a single GPU→CPU→GPU round-trip for all experts, replacing the previous per-expert loop that did `2 × num_experts` transfers (64 sync points → 2 for 32 experts). Further optimization: move to a GPU kernel to eliminate the CPU round-trip entirely.
+2. ~~**Scale conversion is CPU-side**~~ **OPTIMIZED.** Weight scales (B) are converted once at load time. Activation scales (A) now use `batch_convert_a_scales_for_w4a8_gpu()`: layout cosizes computed on CPU (just 32 ints of template math), actual scale data permuted by a GPU kernel (`convert_a_scales_gpu_kernel`) — no scale data transfer to/from CPU. CuTe layout functions are `CUTE_HOST_DEVICE` so `tile_atom_to_shape_SFA` works in `__global__` kernels.
 
 3. **W4A4 correctness not validated against triton.** The W4A4 path uses UE4M3 (float8_e4m3fn) scale factors with group_size=16, which doesn't match triton's UE8M0/group_size=32 format. A separate reference implementation or format conversion is needed. The W4A4 scale layout likely has the same blocked layout requirement.
 
@@ -172,7 +172,7 @@ GPT-OSS-20B has `num_local_experts=32` (not 128 as initially assumed), `num_expe
 | CutlassGptOssExperts torch.compile | 0.0 max diff | Exact match eager vs compiled |
 | Full GPT-OSS-20B forward | 0.34s | Output shape [1, 128, 201088] |
 | Full GPT-OSS-20B torch.compile | 0.053s inference | Warmup ~6s, rel_diff=1.9% vs eager |
-| Full model vs dequantized BF16 | rel_err=2.2% | Expected: CUTLASS quantizes act to FP8 |
+| Full model CUTLASS W4A8 vs Triton W4A4 | TBD | Same FP4 weights, diff is FP8 vs FP4 act precision |
 
 ### 6.4 Key Code References (Updated)
 
@@ -188,13 +188,13 @@ GPT-OSS-20B has `num_local_experts=32` (not 128 as initially assumed), `num_expe
     *   Tests 1-6: building blocks, single/multi-expert, end-to-end, torch.compile
     *   Tests 7-9: edge cases (0-token experts, single token, large batch), 3D input, K-padding
     *   Test 10: batched vs per-expert scale conversion consistency
+    *   Test 11: GPU vs CPU scale conversion consistency
+    *   Test 12: fused routing correctness (counting sort vs argsort)
     *   Profile: forward pass timing breakdown
 
 ## 7. Deferred Items
 
 1.  **W4A4 mode** — Not implemented in CutlassGptOssExperts. Only W4A8 is supported. Can be added later.
-2.  **GPU-side scale conversion kernel** — `batch_convert_a_scales_for_w4a8()` batches the CPU round-trip (2 syncs instead of 64), but the layout permutation still happens on CPU. A CUDA kernel using CuTe's `tile_atom_to_shape_SFA()` (which is `CUTE_HOST_DEVICE`) could eliminate the CPU round-trip entirely.
-3.  **Kernel fusion** — Routing is in pure PyTorch (separate from GEMM). Could fuse routing + gather into a single kernel for performance.
 4.  **Multi-node support** — Only single-node tested. Expert parallelism not implemented.
 5.  **K-padding overhead** — 2.2% extra compute from padding K=2880→2944. Could eliminate with a custom CUTLASS tile shape, but SM120 TMA constraints prevent this.
 6.  **Proper HF quantizer integration** — Currently uses a standalone script that loads dequantized model then swaps. Should create a proper `CutlassMxfp4HfQuantizer` for cleaner integration with `from_pretrained`.

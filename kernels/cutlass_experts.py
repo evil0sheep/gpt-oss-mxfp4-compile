@@ -165,6 +165,28 @@ def ensure_custom_op_registered():
     def _(output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes, expert_offsets, sf_offsets):
         pass  # in-place mutation, no new tensors
 
+    @torch.library.custom_op("cutlass::fused_moe_routing", mutates_args=())
+    def fused_moe_routing(
+        router_indices: torch.Tensor,
+        routing_weights: torch.Tensor,
+        num_experts: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return ext.fused_moe_routing(router_indices, routing_weights, num_experts)
+
+    @fused_moe_routing.register_fake
+    def _(router_indices, routing_weights, num_experts):
+        T = router_indices.shape[0]
+        top_k = router_indices.shape[1]
+        total = T * top_k
+        device = router_indices.device
+        return (
+            torch.empty(total, dtype=torch.int64, device=device),
+            torch.empty(total, dtype=torch.int64, device=device),
+            torch.empty(total, dtype=torch.float32, device=device),
+            torch.empty(num_experts, dtype=torch.int32, device=device),
+            torch.empty(num_experts, dtype=torch.int32, device=device),
+        )
+
     _custom_op_registered = True
 
 
@@ -330,9 +352,9 @@ class CutlassGptOssExperts(nn.Module):
                 activations, act_scales_rowmajor, K
             )
 
-        # Batched scale conversion: single GPU<->CPU round-trip for all experts
-        # (replaces per-expert loop that did 2*num_experts GPU<->CPU transfers)
-        act_scales_blocked, sf_offsets = ext.batch_convert_a_scales_for_w4a8(
+        # GPU-side scale conversion: layout permutation runs on GPU,
+        # only expert counts (E ints) transferred to CPU for cosize computation
+        act_scales_blocked, sf_offsets = ext.batch_convert_a_scales_for_w4a8_gpu(
             act_scales_rowmajor, expert_token_counts, expert_offsets, N, K_padded
         )
 
@@ -372,28 +394,12 @@ class CutlassGptOssExperts(nn.Module):
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         num_tokens = hidden_states.shape[0]
         device = hidden_states.device
-        top_k = router_indices.shape[1]
 
-        # --- Step 1: Route tokens to experts ---
-        token_indices = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1, top_k)
-        flat_token_idx = token_indices.reshape(-1)
-        flat_expert_idx = router_indices.reshape(-1)
-        flat_weights = routing_weights.reshape(-1)
-
-        # Sort by expert index to group tokens per expert
-        sorted_order = torch.argsort(flat_expert_idx, stable=True)
-        sorted_expert_idx = flat_expert_idx[sorted_order]
-        sorted_token_idx = flat_token_idx[sorted_order]
-        sorted_weights = flat_weights[sorted_order]
-
-        # Compute per-expert token counts and offsets
-        expert_token_counts = torch.zeros(self.num_experts, device=device, dtype=torch.int32)
-        expert_token_counts.scatter_add_(
-            0, sorted_expert_idx.to(torch.int64),
-            torch.ones_like(sorted_expert_idx, dtype=torch.int32),
-        )
-        expert_offsets = torch.zeros(self.num_experts, device=device, dtype=torch.int32)
-        torch.cumsum(expert_token_counts[:-1], dim=0, out=expert_offsets[1:])
+        # --- Step 1: Fused routing (counting sort O(n) + histogram) ---
+        sorted_token_idx, sorted_expert_idx, sorted_weights, \
+            expert_token_counts, expert_offsets = \
+            torch.ops.cutlass.fused_moe_routing(
+                router_indices, routing_weights.float(), self.num_experts)
 
         # Gather tokens in expert-sorted order
         gathered_hidden = hidden_states[sorted_token_idx]  # [T*top_k, hidden_size]

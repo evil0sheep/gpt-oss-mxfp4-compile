@@ -222,21 +222,25 @@ def test_compile(model):
     assert status == "PASS", f"torch.compile mismatch: rel_diff={rel_diff}"
 
 
-def test_correctness_vs_dequantized(model, config):
+def test_correctness_vs_triton_mxfp4(model, config):
     """
-    Compare CUTLASS model output against the dequantized BF16 model.
-    Loads a separate dequantized model and compares outputs.
-    """
-    print("\n=== Test: Correctness vs Dequantized BF16 ===")
+    Compare CUTLASS W4A8 model output against the triton MXFP4 W4A4 model.
 
-    # Load dequantized model
-    print("  Loading dequantized BF16 reference model...")
+    Both models use FP4 weights from the same checkpoint, so weight quantization
+    error is identical. The difference is activation precision: CUTLASS uses FP8,
+    triton uses FP4. This should produce lower relative error than comparing
+    against full-precision BF16.
+    """
+    print("\n=== Test: Correctness vs Triton MXFP4 (W4A4) ===")
+
+    # Load triton MXFP4 model (quantized, not dequantized)
+    print("  Loading triton MXFP4 reference model...")
     ref_model = AutoModelForCausalLM.from_pretrained(
         "openai/gpt-oss-20b",
         torch_dtype=torch.bfloat16,
         device_map="cuda",
         trust_remote_code=True,
-        quantization_config=Mxfp4Config(dequantize=True),
+        quantization_config=Mxfp4Config(),
     )
 
     vocab_size = config.vocab_size
@@ -251,11 +255,12 @@ def test_correctness_vs_dequantized(model, config):
     rel_err = diff.mean().item() / (output_ref.logits.float().abs().mean().item() + 1e-8)
     max_diff = diff.max().item()
 
-    print(f"  Relative error: {rel_err:.6f}")
+    print(f"  Relative error (CUTLASS W4A8 vs Triton W4A4): {rel_err:.6f}")
     print(f"  Max diff: {max_diff:.4f}")
 
-    # The CUTLASS model quantizes activations to FP8, so some error is expected
-    status = "PASS" if rel_err < 0.2 else "FAIL"
+    # Both use FP4 weights; diff is only from FP8 vs FP4 activation quantization
+    # Expect much lower error than vs dequantized BF16
+    status = "PASS" if rel_err < 0.1 else "FAIL"
     print(f"  [{status}]")
 
     # Clean up reference model
@@ -278,9 +283,9 @@ def main():
 
     # Correctness test requires loading a second model - skip if OOM
     try:
-        test_correctness_vs_dequantized(model, config)
+        test_correctness_vs_triton_mxfp4(model, config)
     except torch.cuda.OutOfMemoryError:
-        print("\n=== Test: Correctness vs Dequantized BF16 ===")
+        print("\n=== Test: Correctness vs Triton MXFP4 (W4A4) ===")
         print("  SKIPPED (not enough GPU memory for two models)")
 
     print("\n" + "=" * 65)
