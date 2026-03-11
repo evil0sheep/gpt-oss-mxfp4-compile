@@ -1,3 +1,5 @@
 .venv/
 *.log
 deps/
+traces/
+__pycache__
