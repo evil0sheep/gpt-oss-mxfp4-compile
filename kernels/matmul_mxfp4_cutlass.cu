@@ -372,19 +372,19 @@ __global__ void __get_group_gemm_starts_w4a8(
     ScalarSFA* a_scales_base, ScalarSFB* b_scales_base,
     ElementAccumulator* alphas_base, const int32_t* expert_offsets,
     const int32_t* sf_offsets, const int32_t* problem_sizes_as_shapes,
-    const int K, const int N) {
+    const int K, const int N, const int64_t ldb_blockscale) {
   int64_t expert_id = threadIdx.x;
   if (expert_id >= gridDim.x * blockDim.x) {
     return;
   }
   int64_t expert_offset = static_cast<int64_t>(expert_offsets[expert_id]);
   int64_t sf_offset = static_cast<int64_t>(sf_offsets[expert_id]);
-  // size for block in block scale.
-  int64_t group_size = 16;
+  // SfVectorSize for MXFP8/MXFP4 block scaling on SM120 is 32
+  int64_t group_size = 32;
   int64_t m = static_cast<int64_t>(problem_sizes_as_shapes[expert_id * 3]);
   int64_t n = static_cast<int64_t>(problem_sizes_as_shapes[expert_id * 3 + 1]);
   int64_t k = static_cast<int64_t>(problem_sizes_as_shapes[expert_id * 3 + 2]);
-  
+
   int64_t group_k = static_cast<int64_t>(k / group_size);
 
   constexpr bool IsA4Bit = std::is_same_v<ScalarA, cutlass::float_e2m1_t>;
@@ -392,15 +392,19 @@ __global__ void __get_group_gemm_starts_w4a8(
 
   int64_t offset_a = IsA4Bit ? (k / 2) : k;
   int64_t offset_b = IsB4Bit ? (k / 2) : k;
-  
+
   a_offsets[expert_id] = a_base + expert_offset * offset_a;
   b_offsets[expert_id] = b_base + expert_id * n * offset_b;
 
   out_offsets[expert_id] = out_base + expert_offset * n;
-  
+
   // Scales are assumed to be 1 byte (ue4m3 or ue8m0)
-  a_scales_offsets[expert_id] = a_scales_base + sf_offset * group_k;
-  b_scales_offsets[expert_id] = b_scales_base + expert_id * n * group_k;
+  // sf_offset is a raw element offset into the A scales buffer (not multiplied by group_k)
+  // because the CUTLASS blocked layout size may not be a multiple of group_k
+  a_scales_offsets[expert_id] = a_scales_base + sf_offset;
+  // ldb_blockscale is the stride (in elements) between experts in the B scale buffer
+  // (may be larger than n * group_k due to CUTLASS blocked layout padding)
+  b_scales_offsets[expert_id] = b_scales_base + expert_id * ldb_blockscale;
   alpha_offsets[expert_id] = alphas_base + expert_id;
 
   LayoutSFA* layout_sfa_ptr = layout_sfa_base_as_int + expert_id;
@@ -433,7 +437,7 @@ __global__ void __get_group_gemm_starts_w4a8(
             static_cast<float*>(alphas.data_ptr()), \
             static_cast<int32_t*>(expert_offsets.data_ptr()), \
             static_cast<int32_t*>(sf_offsets.data_ptr()), \
-            static_cast<int32_t*>(problem_sizes.data_ptr()), K, N); \
+            static_cast<int32_t*>(problem_sizes.data_ptr()), K, N, ldb_blockscale); \
   }
 
 template <typename ElementA, typename ElementB, typename LayoutSFA, typename LayoutSFB, typename ScaleConfig>
@@ -446,7 +450,8 @@ void run_get_group_gemm_starts_w4a8(
     torch::Tensor const& out_tensors, torch::Tensor const& a_scales,
     torch::Tensor const& b_scales, torch::Tensor const& alphas,
     torch::Tensor const& expert_offsets, torch::Tensor const& sf_offsets,
-    torch::Tensor const& problem_sizes, int M, int N, int K) {
+    torch::Tensor const& problem_sizes, int M, int N, int K,
+    int64_t ldb_blockscale) {
   int num_experts = (int)expert_offsets.size(0);
   auto stream = at::cuda::getCurrentCUDAStream(a_tensors.device().index());
 
@@ -567,10 +572,15 @@ void run_w4a8_group_mm_sm120(
   torch::Tensor b_strides1 =
       torch::full({num_experts}, b.stride(1) * stride_b_multiplier, options_int);
 
+  // Compute stride between experts in the B scale buffer.
+  // The CUTLASS blocked layout may pad N, so the stride per expert may be
+  // larger than N * (K/32). We compute it from the total buffer size.
+  int64_t ldb_blockscale = b_blockscales.numel() / num_experts;
+
   run_get_group_gemm_starts_w4a8<ElementA, ElementB, LayoutSFA, LayoutSFB, ScaleConfig>(
       a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs, alpha_ptrs,
       layout_sfa, layout_sfb, a, b, output, a_blockscale, b_blockscales, alphas,
-      expert_offsets, sf_offsets, problem_sizes, M, N, K);
+      expert_offsets, sf_offsets, problem_sizes, M, N, K, ldb_blockscale);
 
   Gemm gemm_op;
   UnderlyingProblemShape* problem_sizes_as_shapes =
@@ -748,6 +758,120 @@ torch::Tensor convert_b_scales_for_w4a8(
   return convert_scales_w4a8_impl<false>(scales_rowmajor, M, N, K);
 }
 
+// Batched A-scale conversion: converts all experts' activation scales in a single
+// GPU<->CPU round-trip instead of per-expert transfers.
+std::tuple<torch::Tensor, torch::Tensor> batch_convert_a_scales_for_w4a8(
+    const torch::Tensor& scales_rowmajor,  // [total_tokens, k_groups] uint8 on GPU
+    const torch::Tensor& expert_counts_t,  // [E] int32
+    const torch::Tensor& expert_offsets_t, // [E] int32
+    int N, int K) {
+
+  // W4A8 type definitions (same as convert_scales_w4a8_impl)
+  using ElementA = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
+  using ElementB = cutlass::mx_float4_t<cutlass::float_e2m1_t>;
+  using ElementC = cutlass::bfloat16_t;
+  using ElementD = ElementC;
+  using ElementAccumulator = float;
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using LayoutC = cutlass::layout::RowMajor;
+  using LayoutD = LayoutC;
+  static constexpr int AlignmentA = 16;
+  static constexpr int AlignmentB = 32;
+  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+  static constexpr int AlignmentD = AlignmentC;
+  using ArchTag = cutlass::arch::Sm120;
+  using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using MmaTileShape = Shape<_128, _128, _128>;
+  using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int32_t, int32_t, int32_t>>;
+  using FusionOperation = cutlass::epilogue::fusion::LinearCombination<
+      ElementD, ElementAccumulator, ElementC, ElementAccumulator>;
+  using CollectiveEpilogue =
+      typename cutlass::epilogue::collective::CollectiveBuilder<
+          ArchTag, OperatorClass, MmaTileShape, ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator,
+          ElementAccumulator, ElementC, LayoutC*, AlignmentC, ElementD,
+          LayoutD*, AlignmentD,
+          cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative,
+          FusionOperation>::CollectiveOp;
+  using CollectiveMainloop =
+      typename cutlass::gemm::collective::CollectiveBuilder<
+          ArchTag, OperatorClass, ElementA, LayoutA*, AlignmentA, ElementB,
+          LayoutB*, AlignmentB, ElementAccumulator, MmaTileShape, ClusterShape,
+          cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+              sizeof(typename CollectiveEpilogue::SharedStorage))>,
+          cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative>::CollectiveOp;
+  using GemmKernel =
+      cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop,
+                                           CollectiveEpilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  using ScaleConfig =
+      typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+
+  auto device = scales_rowmajor.device();
+  int num_experts = static_cast<int>(expert_counts_t.size(0));
+  int sf_vec_size = ScaleConfig::SFVecSize;
+  int k_groups = K / sf_vec_size;
+
+  // Single GPU->CPU transfer for all data
+  auto scales_cpu = scales_rowmajor.to(torch::kCPU).contiguous();
+  auto counts_cpu = expert_counts_t.to(torch::kCPU).contiguous();
+  auto offsets_cpu = expert_offsets_t.to(torch::kCPU).contiguous();
+
+  auto* in_ptr = scales_cpu.data_ptr<uint8_t>();
+  auto* counts = counts_cpu.data_ptr<int32_t>();
+  auto* offsets = offsets_cpu.data_ptr<int32_t>();
+
+  // Pass 1: compute per-expert output sizes and offsets
+  std::vector<int64_t> sf_offsets_vec(num_experts);
+  std::vector<int64_t> cosizes(num_experts, 0);
+  int64_t total_out = 0;
+
+  for (int i = 0; i < num_experts; i++) {
+    sf_offsets_vec[i] = total_out;
+    int m = counts[i];
+    if (m == 0) continue;
+    auto problem_shape = cute::make_shape(m, N, K, 1);
+    auto layout = ScaleConfig::tile_atom_to_shape_SFA(problem_shape);
+    cosizes[i] = static_cast<int64_t>(cute::cosize(layout));
+    total_out += cosizes[i];
+  }
+
+  if (total_out == 0) {
+    auto empty_scales = torch::zeros({0}, torch::TensorOptions().dtype(torch::kUInt8).device(device));
+    auto sf_t = torch::zeros({num_experts}, torch::TensorOptions().dtype(torch::kInt32).device(device));
+    return std::make_tuple(empty_scales, sf_t);
+  }
+
+  // Pass 2: convert all experts on CPU in one batch
+  auto out_cpu = torch::zeros({total_out}, torch::TensorOptions().dtype(torch::kUInt8));
+  auto* out_ptr = out_cpu.data_ptr<uint8_t>();
+
+  for (int i = 0; i < num_experts; i++) {
+    int m = counts[i];
+    if (m == 0) continue;
+    auto problem_shape = cute::make_shape(m, N, K, 1);
+    auto layout = ScaleConfig::tile_atom_to_shape_SFA(problem_shape);
+
+    int in_base = offsets[i] * k_groups;
+    int64_t out_base = sf_offsets_vec[i];
+
+    for (int r = 0; r < m; r++) {
+      for (int kg = 0; kg < k_groups; kg++) {
+        out_ptr[out_base + layout(r, kg * sf_vec_size, 0)] =
+            in_ptr[in_base + r * k_groups + kg];
+      }
+    }
+  }
+
+  // Single CPU->GPU transfer
+  auto sf_offsets_t = torch::tensor(sf_offsets_vec,
+      torch::TensorOptions().dtype(torch::kInt32));
+
+  return std::make_tuple(out_cpu.to(device), sf_offsets_t.to(device));
+}
+
 // =================================================================================================
 // MAIN DISPATCHER
 // =================================================================================================
@@ -796,8 +920,8 @@ void cutlass_fp4_group_mm(
     "b_blockscales must be Float8_e4m3fn or Byte (UE8M0)");
   CHECK_INPUT(alphas, at::ScalarType::Float, "alphas");
 
-  TORCH_CHECK(a_blockscale.dim() == 2, "Invalid a_blockscale dim");
-  TORCH_CHECK(b_blockscales.dim() == 3, "Invalid b_blockscales dim");
+  TORCH_CHECK(a_blockscale.dim() >= 1, "Invalid a_blockscale dim");
+  TORCH_CHECK(b_blockscales.dim() == 2 || b_blockscales.dim() == 3, "Invalid b_blockscales dim (expected 2D [E, converted_size] or 3D [E, N, K_groups])");
   TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D");
   
   int M = static_cast<int>(a.size(0));
@@ -831,4 +955,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Convert A scales from row-major to CUTLASS blocked layout for W4A8");
   m.def("convert_b_scales_for_w4a8", &convert_b_scales_for_w4a8,
         "Convert B scales from row-major to CUTLASS blocked layout for W4A8");
+  m.def("batch_convert_a_scales_for_w4a8", &batch_convert_a_scales_for_w4a8,
+        "Batch convert A scales for all experts in one GPU<->CPU round-trip");
 }
