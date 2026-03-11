@@ -137,7 +137,8 @@ time python3 kernels/benchmark_matmul_mxfp4_cutlass.py
 
 `CutlassGptOssExperts` (`kernels/cutlass_experts.py`) is a drop-in replacement for `Mxfp4GptOssExperts` that:
 - Uses CUTLASS W4A8 grouped GEMM instead of triton's `matmul_ogs`
-- Implements pure PyTorch routing (argsort + scatter_add)
+- Fused CUDA routing kernel (counting sort O(n) vs argsort O(n log n))
+- GPU-side activation scale layout conversion (no CPU round-trip for scale data)
 - Quantizes activations to FP8 per-inference using standard PyTorch ops
 - SwiGLU activation in pure PyTorch
 - Fully compatible with `torch.compile`
@@ -170,20 +171,49 @@ GPT-OSS-20B has `num_local_experts=32` (not 128 as initially assumed), `num_expe
 | Building blocks (quantize, swiglu, single-expert, multi-expert) | 0.0% error | Exact match vs triton reference |
 | CutlassGptOssExperts module | rel_err=0.044 | vs dequantized BF16 reference |
 | CutlassGptOssExperts torch.compile | 0.0 max diff | Exact match eager vs compiled |
-| Full GPT-OSS-20B forward | 0.34s | Output shape [1, 128, 201088] |
-| Full GPT-OSS-20B torch.compile | 0.053s inference | Warmup ~6s, rel_diff=1.9% vs eager |
-| Full model CUTLASS W4A8 vs Triton W4A4 | TBD | Same FP4 weights, diff is FP8 vs FP4 act precision |
+| Full GPT-OSS-20B forward | 34.55ms eager | Output shape [1, 128, 201088] |
+| Full GPT-OSS-20B torch.compile | 30.67ms inference | Warmup ~7s, rel_diff=1.9% vs eager |
+| GPU vs CPU scale conversion | 0.0% error | Exact match (Test 11) |
+| Fused routing vs argsort | rel_err=0.001 | Exact expert counts/offsets; bf16 order diff only |
 
-### 6.4 Key Code References (Updated)
+### 6.4 Performance Optimization Results
+
+Benchmarked on GPT-OSS-20B full model forward (seq_len=128, 24 layers, 32 experts):
+
+| Configuration | Eager (ms) | Compiled (ms) |
+|---|---|---|
+| **GPU scales + fused routing (optimized)** | **34.55** | **30.67** |
+| CPU batched scales + fused routing | 40.93 | 41.49 |
+| GPU scales + Python argsort routing | 35.55 | 39.28 |
+
+**Impact of individual optimizations (compiled):**
+
+| Optimization | Savings | Relative Improvement |
+|---|---|---|
+| GPU scale conversion (vs CPU batched) | 10.82ms | 26.1% faster |
+| Fused routing kernel (vs Python argsort) | 8.61ms | 21.9% faster |
+| Combined | ~19ms | ~39% faster |
+
+**Key observations:**
+- GPU scale conversion eliminates CPU round-trips for scale data. Only 32 ints (expert counts) go to CPU for CuTe cosize computation.
+- Fused routing has outsized compiled impact (8.6ms compiled vs 1ms eager) because `torch.compile` cannot efficiently fuse the Python argsort + scatter_add pattern.
+- `torch.compile` provides 11% speedup on the optimized path but *hurts* configs with CPU sync points or Python routing ops (graph breaks prevent optimization).
+
+### 6.5 Key Code References (Updated)
 
 *   **CutlassGptOssExperts:** `kernels/cutlass_experts.py`
     *   `quantize_activations_to_fp8()` — BF16→FP8 quantization
     *   `swiglu()` — SwiGLU activation
     *   `CutlassGptOssExperts` — Full module
     *   `load_cutlass_weights()` — Checkpoint loading + scale conversion + K-padding
+*   **CUDA kernels:** `kernels/matmul_mxfp4_cutlass.cu`
+    *   `convert_a_scales_gpu_kernel` — GPU-side activation scale layout permutation
+    *   `batch_convert_a_scales_for_w4a8_gpu()` — Host launcher for GPU scale conversion
+    *   `moe_histogram_kernel` + `moe_sort_kernel` — Fused O(n) counting sort routing
+    *   `fused_moe_routing()` — Host function combining histogram + sort
 *   **Full model test:** `test_cutlass_model.py`
     *   Loads GPT-OSS-20B with dequantized weights, replaces experts from checkpoint
-    *   Tests: forward, torch.compile, correctness vs dequantized BF16
+    *   Tests: forward, torch.compile, correctness vs triton MXFP4 (W4A4)
 *   **Unit tests:** `kernels/test_cutlass_experts.py`
     *   Tests 1-6: building blocks, single/multi-expert, end-to-end, torch.compile
     *   Tests 7-9: edge cases (0-token experts, single token, large batch), 3D input, K-padding
@@ -191,10 +221,13 @@ GPT-OSS-20B has `num_local_experts=32` (not 128 as initially assumed), `num_expe
     *   Test 11: GPU vs CPU scale conversion consistency
     *   Test 12: fused routing correctness (counting sort vs argsort)
     *   Profile: forward pass timing breakdown
+*   **Optimization benchmark:** `benchmark_optimizations.py`
+    *   A/B/C comparison of GPU scale conversion and fused routing impact
+    *   Tests eager and compiled model forward times
 
 ## 7. Deferred Items
 
 1.  **W4A4 mode** — Not implemented in CutlassGptOssExperts. Only W4A8 is supported. Can be added later.
-4.  **Multi-node support** — Only single-node tested. Expert parallelism not implemented.
-5.  **K-padding overhead** — 2.2% extra compute from padding K=2880→2944. Could eliminate with a custom CUTLASS tile shape, but SM120 TMA constraints prevent this.
-6.  **Proper HF quantizer integration** — Currently uses a standalone script that loads dequantized model then swaps. Should create a proper `CutlassMxfp4HfQuantizer` for cleaner integration with `from_pretrained`.
+2.  **Multi-node support** — Only single-node tested. Expert parallelism not implemented.
+3.  **K-padding overhead** — 2.2% extra compute from padding K=2880→2944. Could eliminate with a custom CUTLASS tile shape, but SM120 TMA constraints prevent this.
+4.  **Proper HF quantizer integration** — Currently uses a standalone script that loads dequantized model then swaps. Should create a proper `CutlassMxfp4HfQuantizer` for cleaner integration with `from_pretrained`.
